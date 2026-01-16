@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+*.bin
+*.elf
+*.img
+*.EFI
+
+# ESP directory (UEFI boot files)
+esp/
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store

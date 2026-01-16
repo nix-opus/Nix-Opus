@@ -1,0 +1,165 @@
+#
+# Nix-Opus UEFI Build System
+# Builds a 64-bit UEFI-bootable OS
+#
+
+# Kernel tools (x86_64-elf cross compiler)
+CC = x86_64-elf-gcc
+LD = x86_64-elf-ld
+OBJCOPY = x86_64-elf-objcopy
+
+# UEFI bootloader tools (mingw-w64 for PE executables)
+UEFI_CC = x86_64-w64-mingw32-gcc
+UEFI_LD = x86_64-w64-mingw32-ld
+UEFI_OBJCOPY = x86_64-w64-mingw32-objcopy
+
+# Directories
+BOOT_DIR = boot/uefi
+KERNEL_DIR = kernel64
+
+# Kernel flags
+CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
+         -mcmodel=kernel -O2 -Wall -Wextra -nostdlib -nostdinc \
+         -fno-exceptions -mno-sse -mno-mmx -mno-sse2
+
+LDFLAGS = -nostdlib -T $(KERNEL_DIR)/linker.ld -z max-page-size=0x1000
+
+# UEFI bootloader flags
+UEFI_CFLAGS = -ffreestanding -fno-stack-protector -fshort-wchar -mno-red-zone \
+              -O2 -Wall -Wextra -nostdlib -nostdinc -maccumulate-outgoing-args \
+              -I$(BOOT_DIR)
+
+UEFI_LDFLAGS = -nostdlib -Wl,-dll -Wl,--subsystem,10 -e efi_main -s
+
+# Output files
+KERNEL_ELF = $(KERNEL_DIR)/kernel.elf
+KERNEL_BIN = $(KERNEL_DIR)/kernel.bin
+BOOTLOADER = $(BOOT_DIR)/BOOTX64.EFI
+ESP_DIR = esp
+
+# Kernel sources
+KERNEL_ASM = $(KERNEL_DIR)/arch/x86_64/boot.S
+KERNEL_C = $(KERNEL_DIR)/kernel.c \
+           $(KERNEL_DIR)/console.c \
+           $(KERNEL_DIR)/keyboard.c \
+           $(KERNEL_DIR)/shell.c
+
+# Object files
+KERNEL_ASM_OBJ = $(KERNEL_ASM:.S=.o)
+KERNEL_C_OBJ = $(KERNEL_C:.c=.o)
+KERNEL_OBJS = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ)
+
+.PHONY: all clean run debug bootloader kernel esp
+
+all: esp
+
+# Build ESP (EFI System Partition) directory structure
+esp: bootloader kernel
+	@echo "Creating ESP directory structure..."
+	@mkdir -p $(ESP_DIR)/EFI/BOOT
+	@mkdir -p $(ESP_DIR)/EFI/NIXOPUS
+	@cp $(BOOTLOADER) $(ESP_DIR)/EFI/BOOT/BOOTX64.EFI
+	@cp $(KERNEL_BIN) $(ESP_DIR)/EFI/NIXOPUS/KERNEL.BIN
+	@cp $(KERNEL_BIN) $(ESP_DIR)/KERNEL.BIN
+	@echo "ESP created successfully!"
+	@echo "  Bootloader: $(ESP_DIR)/EFI/BOOT/BOOTX64.EFI"
+	@echo "  Kernel: $(ESP_DIR)/EFI/NIXOPUS/KERNEL.BIN"
+
+# Build bootloader
+bootloader: $(BOOTLOADER)
+
+$(BOOTLOADER): $(BOOT_DIR)/main.c $(BOOT_DIR)/uefi.h $(BOOT_DIR)/bootinfo.h
+	@echo "Building UEFI bootloader..."
+	@mkdir -p $(dir $@)
+	$(UEFI_CC) $(UEFI_CFLAGS) $(UEFI_LDFLAGS) -o $@ $(BOOT_DIR)/main.c
+	@echo "Bootloader built: $@"
+	@ls -la $@
+
+# Build kernel
+kernel: $(KERNEL_BIN)
+
+$(KERNEL_ELF): $(KERNEL_OBJS) $(KERNEL_DIR)/linker.ld
+	@echo "Linking kernel..."
+	$(LD) $(LDFLAGS) -o $@ $(KERNEL_OBJS)
+
+$(KERNEL_BIN): $(KERNEL_ELF)
+	@echo "Creating kernel binary..."
+	$(OBJCOPY) -O binary $< $@
+	@SIZE=$$(wc -c < $@); echo "Kernel size: $$SIZE bytes"
+
+# Compile assembly
+$(KERNEL_DIR)/arch/x86_64/%.o: $(KERNEL_DIR)/arch/x86_64/%.S
+	@echo "  AS    $<"
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Compile C files
+$(KERNEL_DIR)/%.o: $(KERNEL_DIR)/%.c
+	@echo "  CC    $<"
+	$(CC) $(CFLAGS) -I$(KERNEL_DIR) -c $< -o $@
+
+# UEFI firmware location
+OVMF_CODE := $(shell ls /opt/homebrew/Cellar/qemu/*/share/qemu/edk2-x86_64-code.fd 2>/dev/null | head -1)
+OVMF_VARS := $(shell ls /opt/homebrew/Cellar/qemu/*/share/qemu/edk2-i386-vars.fd 2>/dev/null | head -1)
+
+# Create a writable copy of NVRAM vars
+$(ESP_DIR)/OVMF_VARS.fd: $(OVMF_VARS)
+	@mkdir -p $(ESP_DIR)
+	@cp $(OVMF_VARS) $@
+
+# Run in QEMU with UEFI (serial only for CI)
+run: esp $(ESP_DIR)/OVMF_VARS.fd
+	@echo "Starting QEMU with UEFI..."
+	qemu-system-x86_64 \
+	    -machine q35 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(ESP_DIR)/OVMF_VARS.fd \
+	    -drive format=raw,file=fat:rw:$(ESP_DIR) \
+	    -m 256M \
+	    -serial stdio \
+	    -net none
+
+# Run with display window (for graphical output)
+run-gui: esp $(ESP_DIR)/OVMF_VARS.fd
+	@echo "Starting QEMU with UEFI (GUI mode)..."
+	qemu-system-x86_64 \
+	    -machine q35 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(ESP_DIR)/OVMF_VARS.fd \
+	    -drive format=raw,file=fat:rw:$(ESP_DIR) \
+	    -m 256M \
+	    -serial mon:stdio \
+	    -net none \
+	    -display default
+
+# Debug mode
+debug: esp $(ESP_DIR)/OVMF_VARS.fd
+	@echo "Starting QEMU in debug mode..."
+	qemu-system-x86_64 \
+	    -machine q35 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(ESP_DIR)/OVMF_VARS.fd \
+	    -drive format=raw,file=fat:rw:$(ESP_DIR) \
+	    -m 256M \
+	    -serial stdio \
+	    -net none \
+	    -S -gdb tcp::1234
+
+# Clean
+clean:
+	rm -f $(KERNEL_DIR)/*.o $(KERNEL_DIR)/arch/x86_64/*.o
+	rm -f $(KERNEL_ELF) $(KERNEL_BIN)
+	rm -f $(BOOT_DIR)/*.o $(BOOTLOADER)
+	rm -rf $(ESP_DIR)
+
+# Help
+help:
+	@echo "Nix-Opus UEFI Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all       - Build everything (default)"
+	@echo "  bootloader - Build UEFI bootloader only"
+	@echo "  kernel    - Build kernel only"
+	@echo "  esp       - Create ESP directory"
+	@echo "  run       - Build and run in QEMU"
+	@echo "  debug     - Build and run with GDB server"
+	@echo "  clean     - Remove build files"
